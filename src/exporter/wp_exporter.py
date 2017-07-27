@@ -12,6 +12,7 @@ from wordpress_json import WordpressJsonWrapper, WordpressError
 
 from exporter.utils import Utils
 from settings import WP_SUPERADMIN_USER, WP_SUPERADMIN_PASSWORD, WP_PATH, CONFIGURED_LANGUAGES
+from requests_futures.sessions import FuturesSession
 
 
 class WPExporter:
@@ -47,9 +48,9 @@ class WPExporter:
         self.output_dir = output_dir
 
         # we use the python-wordpress-json library to interact with the wordpress REST API
-        rest_api_url = "http://%s/%s/?rest_route=/wp/v2" % (self.host, self.path)
-        logging.info("setting up API on '%s', with %s:xxxxxx", rest_api_url, WP_SUPERADMIN_USER)
-        self.wp = WordpressJsonWrapper(rest_api_url, WP_SUPERADMIN_USER, WP_SUPERADMIN_PASSWORD)
+        self.rest_api_url = "http://%s/%s/?rest_route=/wp/v2" % (self.host, self.path)
+        logging.info("setting up API on '%s', with %s:xxxxxx", self.rest_api_url, WP_SUPERADMIN_USER)
+        self.wp = WordpressJsonWrapper(self.rest_api_url, WP_SUPERADMIN_USER, WP_SUPERADMIN_PASSWORD)
 
     def wp_cli(self, command, stdin=None):
         """
@@ -121,16 +122,127 @@ class WPExporter:
                 logging.info("Deleting language %s", lang)
                 self.wp_cli('pll lang delete %s' % lang)
 
-    def import_medias(self):
+    def import_medias(self, old=True):
         """
         Import medias to Wordpress
         """
         logging.info("{0:%Y-%m-%d %H:%M:%S} WP medias import start".format(datetime.now()))
-        for file in self.site.files:
-            wp_media = self.import_media(file)
-            if wp_media:
-                self.fix_file_links(file, wp_media)
-                self.report['files'] += 1
+
+        start_time = timeit.default_timer()
+
+        if old:
+            for file in self.site.files:
+                wp_media = self.import_media(file)
+                if wp_media:
+                    self.fix_file_links(file, wp_media)
+                    self.report['files'] += 1
+
+        else:
+
+            all_files = self.site.files
+            nb_files = len(self.site.files)
+
+            SLICE_LEN = 50
+            min_boundary = 0
+            max_boundary = SLICE_LEN
+
+            while True:
+
+                l = []
+
+                if max_boundary > nb_files:
+                    slice = all_files[min_boundary:]
+                else:
+                    slice = all_files[min_boundary:max_boundary]
+
+                for media in slice:
+
+                    try:
+
+                        file_path = media.path + '/' + media.name
+                        file = open(file_path, 'rb')
+
+                        files = {
+                            'file': file
+                        }
+
+                        wp_media_info = {
+                            # date
+                            # date_gmt
+                            'slug': media.path,
+                            # status
+                            'title': media.name,
+                            # author
+                            # comment_status
+                            # ping_status
+                            # meta
+                            # template
+                            # alt_text
+                            # caption
+                            # description
+                            # post
+                        }
+                        files = files
+
+                        session = FuturesSession()
+                        l.append(
+                            (media,
+                             session.request(
+                                'POST',
+                                self.rest_api_url + '/media',
+                                auth=(WP_SUPERADMIN_USER, WP_SUPERADMIN_PASSWORD),
+                                params=None,
+                                data=wp_media_info,
+                                json=None,
+                                headers=None,
+                                files=files)
+                             )
+                        )
+                    except Exception as e:
+                        logging.error("%s - WP export - media failed: %s", self.site.name, e)
+                        self.report['failed_files'] += 1
+
+
+                for media, response in l:
+                    try:
+                        http_response = response.result()
+
+                        if http_response.status_code not in [200, 201]:
+                            if 'application/json' in http_response.headers.get('Content-Type'):
+                                code = http_response.json().get('code')
+                                message = http_response.json().get('message')
+                            else:
+                                code = http_response.status_code
+                                message = http_response.text
+                            raise WordpressError(" ".join([
+                                str(http_response.status_code),
+                                str(http_response.reason),
+                                ":",
+                                '[{code}] {message}'.format(code=code, message=message)
+                            ]))
+                        elif 'application/json' in http_response.headers.get('Content-Type'):
+                            wp_media = http_response.json()
+                        else:
+                            raise WordpressError(" ".join([
+                                "Expected JSON response but got",
+                                http_response.headers.get('Content-Type')]))
+
+                        if wp_media:
+                            self.fix_file_links(media, wp_media)
+
+                            self.report['files'] += 1
+                    except Exception as e:
+                        logging.error("%s - WP export - media failed: %s", self.site.name, e)
+                        self.report['failed_files'] += 1
+
+                if max_boundary > nb_files:
+                    break
+
+                min_boundary += SLICE_LEN
+                max_boundary += SLICE_LEN
+
+        elapsed = timedelta(seconds=timeit.default_timer() - start_time)
+        logging.info("TIME TO UPLOAD ALL MEDIAS %s" % elapsed)
         logging.info("{0:%Y-%m-%d %H:%M:%S} WP medias imported".format(datetime.now()))
 
     def import_media(self, media):

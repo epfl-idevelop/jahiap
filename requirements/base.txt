@@ -11,3 +11,4 @@ lxml==3.8.0
 docker-compose==1.14.0
 cookiecutter==1.5.1
 simplejson==3.11.1
+requests-futures==0.9.7
